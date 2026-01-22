@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-    PL/SQL 分析ツール - INSERT/UPDATE文を解析
+    PL/SQL 分析ツール - INSERT/UPDATE文を解析（変数追跡機能付き）
 .DESCRIPTION
     Windows PowerShell 5.1 および PowerShell Core 対応
+    SJIS/UTF-8 両対応
 #>
 
 param(
@@ -39,6 +40,208 @@ $logFile = Join-Path $logDir ("analyze_" + (Get-Date -Format 'yyyyMMdd_HHmmss') 
 function Write-Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $logFile -Value "$ts - $msg" -Encoding UTF8
+}
+
+# グローバル変数マップ（変数名 -> 値/ソース情報）
+$script:VariableMap = @{}
+
+# 変数代入を解析（:= 形式）
+function Parse-Assignments {
+    param([string]$Content)
+
+    $script:VariableMap = @{}
+
+    # := 代入を探す（日本語変数名対応）
+    $pattern = "(\S+)\s*:=\s*([^;]+);"
+    $matches = [regex]::Matches($Content, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+    foreach ($m in $matches) {
+        $varName = $m.Groups[1].Value.Trim()
+        $varValue = $m.Groups[2].Value.Trim()
+
+        # 変数マップに追加（後の代入で上書き）
+        $script:VariableMap[$varName.ToUpper()] = @{
+            Value = $varValue
+            Type = "ASSIGN"
+        }
+    }
+
+    # SELECT INTO を探す
+    $selectIntoPattern = "SELECT\s+(.+?)\s+INTO\s+([^;]+?)\s+FROM"
+    $selectMatches = [regex]::Matches($Content, $selectIntoPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+
+    foreach ($m in $selectMatches) {
+        $selectCols = $m.Groups[1].Value.Trim()
+        $intoVars = $m.Groups[2].Value.Trim()
+
+        $cols = Split-ByComma -Text $selectCols
+        $vars = Split-ByComma -Text $intoVars
+
+        for ($i = 0; $i -lt $vars.Count; $i++) {
+            $varName = [string]$vars[$i]
+            $varName = $varName.Trim()
+            $colValue = if ($i -lt $cols.Count) { [string]$cols[$i] } else { "?" }
+            $colValue = $colValue.Trim()
+
+            $script:VariableMap[$varName.ToUpper()] = @{
+                Value = $colValue
+                Type = "SELECT_INTO"
+            }
+        }
+    }
+
+    # IF文内の代入を探す（条件付き代入、日本語変数名対応）
+    # (?<!ELS)IF でELSIFを除外
+    $ifPattern = "(?<!ELS)IF\s+([^;]+?)\s+THEN\s+(\S+)\s*:=\s*([^;]+);"
+    $ifMatches = [regex]::Matches($Content, $ifPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+
+    foreach ($m in $ifMatches) {
+        $condition = $m.Groups[1].Value.Trim()
+        $varName = $m.Groups[2].Value.Trim()
+        $varValue = $m.Groups[3].Value.Trim()
+
+        $key = $varName.ToUpper()
+        if ($script:VariableMap.ContainsKey($key)) {
+            # 既存エントリに条件を追加
+            $existing = $script:VariableMap[$key]
+            if ($existing.Type -eq "CONDITIONAL") {
+                $existing.Conditions += @{ Condition = $condition; Value = $varValue }
+            } else {
+                $script:VariableMap[$key] = @{
+                    Type = "CONDITIONAL"
+                    Conditions = @(
+                        @{ Condition = "DEFAULT"; Value = $existing.Value },
+                        @{ Condition = $condition; Value = $varValue }
+                    )
+                }
+            }
+        } else {
+            $script:VariableMap[$key] = @{
+                Type = "CONDITIONAL"
+                Conditions = @(@{ Condition = $condition; Value = $varValue })
+            }
+        }
+    }
+
+    # ELSIF/ELSE内の代入（日本語変数名対応）
+    $elsifPattern = "ELSIF\s+(.+?)\s+THEN\s+(\S+)\s*:=\s*([^;]+);"
+    $elsifMatches = [regex]::Matches($Content, $elsifPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+
+    foreach ($m in $elsifMatches) {
+        $condition = $m.Groups[1].Value.Trim()
+        $varName = $m.Groups[2].Value.Trim()
+        $varValue = $m.Groups[3].Value.Trim()
+
+        $key = $varName.ToUpper()
+        if ($script:VariableMap.ContainsKey($key) -and $script:VariableMap[$key].Type -eq "CONDITIONAL") {
+            $script:VariableMap[$key].Conditions += @{ Condition = $condition; Value = $varValue }
+        }
+    }
+
+    $elsePattern = "ELSE\s+(\S+)\s*:=\s*([^;]+);"
+    $elseMatches = [regex]::Matches($Content, $elsePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+    foreach ($m in $elseMatches) {
+        $varName = $m.Groups[1].Value.Trim()
+        $varValue = $m.Groups[2].Value.Trim()
+
+        $key = $varName.ToUpper()
+        if ($script:VariableMap.ContainsKey($key) -and $script:VariableMap[$key].Type -eq "CONDITIONAL") {
+            $script:VariableMap[$key].Conditions += @{ Condition = "その他"; Value = $varValue }
+        }
+    }
+}
+
+# 変数の値チェーンを追跡
+function Trace-VariableChain {
+    param([string]$VarName, [int]$MaxDepth = 5)
+
+    $chain = @()
+    $current = $VarName.ToUpper()
+    $visited = @{}
+    $depth = 0
+
+    while ($depth -lt $MaxDepth) {
+        if ($visited.ContainsKey($current)) { break }
+        $visited[$current] = $true
+
+        if (-not $script:VariableMap.ContainsKey($current)) { break }
+
+        $info = $script:VariableMap[$current]
+
+        if ($info.Type -eq "CONDITIONAL") {
+            return @{
+                Type = "CONDITIONAL"
+                VarName = $VarName
+                Conditions = $info.Conditions
+            }
+        }
+
+        $chain += @{
+            Var = $current
+            Value = $info.Value
+            Type = $info.Type
+        }
+
+        # 次の変数を探す（日本語変数名対応: v_で始まる変数）
+        $nextValue = $info.Value
+        if ($nextValue -match "^v_\S+$" -and $nextValue.ToUpper() -ne $current) {
+            $current = $nextValue.ToUpper()
+        } else {
+            break
+        }
+
+        $depth++
+    }
+
+    if ($chain.Count -eq 0) {
+        return $null
+    }
+
+    return @{
+        Type = "CHAIN"
+        Chain = $chain
+    }
+}
+
+# 変数の完全な説明を生成
+function Format-VariableTrace {
+    param([string]$VarName)
+
+    $trace = Trace-VariableChain -VarName $VarName
+
+    if ($null -eq $trace) {
+        return $null
+    }
+
+    if ($trace.Type -eq "CONDITIONAL") {
+        $lines = @()
+        foreach ($cond in $trace.Conditions) {
+            $condVal = $cond.Value
+            # 値がさらに変数の場合は追跡（日本語変数名対応）
+            if ($condVal -match "^v_\S+$") {
+                $subTrace = Format-VariableTrace -VarName $condVal
+                if ($subTrace) {
+                    $condVal = "$condVal -> $subTrace"
+                }
+            }
+            $lines += "[$($cond.Condition)] -> $condVal"
+        }
+        return @{ Type = "CONDITIONAL"; Lines = $lines }
+    }
+
+    if ($trace.Type -eq "CHAIN" -and $trace.Chain.Count -gt 0) {
+        $parts = @()
+        foreach ($item in $trace.Chain) {
+            $parts += $item.Var
+        }
+        $lastValue = $trace.Chain[-1].Value
+        $parts += $lastValue
+
+        return @{ Type = "CHAIN"; Text = ($parts -join " -> ") }
+    }
+
+    return $null
 }
 
 function Get-SQLStatements {
@@ -132,7 +335,6 @@ function Get-Columns {
     return $cols
 }
 
-# 括弧を考慮してカンマで分割
 function Split-ByComma {
     param([string]$Text)
 
@@ -156,7 +358,6 @@ function Split-ByComma {
     return $items
 }
 
-# VALUES部分の値を取得
 function Get-ValuesContent {
     param([string]$Statement)
 
@@ -164,11 +365,9 @@ function Get-ValuesContent {
     $valIdx = $upper.IndexOf("VALUES")
     if ($valIdx -lt 0) { return @() }
 
-    # VALUES後の最初の(を探す
     $lpIdx = $Statement.IndexOf("(", $valIdx)
     if ($lpIdx -lt 0) { return @() }
 
-    # 対応する)を探す
     $depth = 1
     $rpIdx = -1
     for ($i = $lpIdx + 1; $i -lt $Statement.Length; $i++) {
@@ -190,7 +389,6 @@ function Get-ValuesContent {
     return @()
 }
 
-# SELECT部分の値を取得
 function Get-SelectColumns {
     param([string]$Statement)
 
@@ -205,7 +403,6 @@ function Get-SelectColumns {
     return Split-ByComma -Text $selPart
 }
 
-# CASE文を解析して説明文字列を生成
 function Format-CaseExpression {
     param([string]$Expr)
 
@@ -248,7 +445,16 @@ function Format-CaseExpression {
 
         $value = $caseExpr.Substring($valueStart, $valueEnd - $valueStart).Trim().Trim("'", " ", ",")
 
-        $result += "[$condition] -> [$value]"
+        # 値が変数の場合は追跡
+        $valueDisplay = $value
+        if ($value -match "^v_\S+$") {
+            $trace = Format-VariableTrace -VarName $value
+            if ($trace -and $trace.Type -eq "CHAIN") {
+                $valueDisplay = $trace.Text
+            }
+        }
+
+        $result += "[$condition] -> $valueDisplay"
         $whenIdx = $tIdx + 6
     }
 
@@ -257,14 +463,22 @@ function Format-CaseExpression {
         $endKeyword = $caseUpper.IndexOf("END", $elseIdx)
         if ($endKeyword -gt $elseIdx) {
             $elseValue = $caseExpr.Substring($elseIdx + 5, $endKeyword - $elseIdx - 5).Trim().Trim("'", " ")
-            $result += "[その他] -> [$elseValue]"
+
+            $valueDisplay = $elseValue
+            if ($elseValue -match "^v_\S+$") {
+                $trace = Format-VariableTrace -VarName $elseValue
+                if ($trace -and $trace.Type -eq "CHAIN") {
+                    $valueDisplay = $trace.Text
+                }
+            }
+
+            $result += "[その他] -> $valueDisplay"
         }
     }
 
     return $result
 }
 
-# 値の説明を生成
 function Format-ValueDescription {
     param([string]$Value)
 
@@ -279,6 +493,19 @@ function Format-ValueDescription {
         }
     }
 
+    # 変数 (v_で始まる)
+    if ($val -match "^v_\S+$") {
+        $trace = Format-VariableTrace -VarName $val
+        if ($trace) {
+            if ($trace.Type -eq "CHAIN") {
+                return @{ Type = "SIMPLE"; Text = $trace.Text }
+            } elseif ($trace.Type -eq "CONDITIONAL") {
+                return @{ Type = "CASE"; Lines = $trace.Lines }
+            }
+        }
+        return @{ Type = "SIMPLE"; Text = "変数: $val (未定義)" }
+    }
+
     # シーケンス
     if ($upper.Contains(".NEXTVAL")) {
         return @{ Type = "SIMPLE"; Text = "(シーケンス自動採番)" }
@@ -291,10 +518,22 @@ function Format-ValueDescription {
 
     # NVL
     if ($upper.StartsWith("NVL(")) {
-        return @{ Type = "SIMPLE"; Text = $val + " (NULLの場合はデフォルト値)" }
+        # NVL内の変数も追跡
+        if ($val -match "NVL\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)") {
+            $nvlVar = $Matches[1].Trim()
+            $nvlDefault = $Matches[2].Trim()
+
+            if ($nvlVar -match "^v_\S+$") {
+                $trace = Format-VariableTrace -VarName $nvlVar
+                if ($trace -and $trace.Type -eq "CHAIN") {
+                    return @{ Type = "SIMPLE"; Text = "$($trace.Text) (NULLなら $nvlDefault)" }
+                }
+            }
+        }
+        return @{ Type = "SIMPLE"; Text = "$val (NULLの場合はデフォルト値)" }
     }
 
-    # 関数呼び出し (SUM, COUNT, AVG, ROUND, TO_CHAR等)
+    # 関数呼び出し
     if ($upper -match "^(SUM|COUNT|AVG|ROUND|TO_CHAR|TRUNC|MAX|MIN)\s*\(") {
         return @{ Type = "SIMPLE"; Text = $val }
     }
@@ -304,7 +543,7 @@ function Format-ValueDescription {
         return @{ Type = "SIMPLE"; Text = $val + " から取得" }
     }
 
-    # 計算式 (例: od.数量 * p.単価)
+    # 計算式
     if ($val -match "\*|\+|\-|\/") {
         return @{ Type = "SIMPLE"; Text = $val + " (計算)" }
     }
@@ -319,12 +558,7 @@ function Format-ValueDescription {
         return @{ Type = "SIMPLE"; Text = "固定値: $val" }
     }
 
-    # 変数 (v_で始まる)
-    if ($val -match "^v_") {
-        return @{ Type = "SIMPLE"; Text = "変数: $val" }
-    }
-
-    # エイリアス付きカラム (例: c.顧客ID)
+    # エイリアス付きカラム
     if ($val -match "^[a-zA-Z]+\..+$") {
         return @{ Type = "SIMPLE"; Text = $val + " から取得" }
     }
@@ -417,7 +651,6 @@ function Get-WhereConditions {
 
     if ($whereIdx -ge 0) {
         $wherePart = $Statement.Substring($whereIdx + 6)
-        # GROUP BYやORDER BYがあればそこまで
         $groupIdx = $wherePart.ToUpper().IndexOf(" GROUP BY")
         $orderIdx = $wherePart.ToUpper().IndexOf(" ORDER BY")
         if ($groupIdx -gt 0) { $wherePart = $wherePart.Substring(0, $groupIdx) }
@@ -487,7 +720,6 @@ function Get-SetColumns {
     return $columns
 }
 
-# INSERT文を解析
 function Parse-InsertStatement {
     param([string]$Statement)
 
@@ -534,7 +766,7 @@ function Parse-InsertStatement {
 }
 
 function Generate-Report {
-    param($Inserts, $Updates, $FileName)
+    param($Inserts, $Updates, $FileName, $VariableCount)
 
     $lines = @()
     $lines += "=" * 80
@@ -549,6 +781,7 @@ function Generate-Report {
     $lines += "-" * 80
     $lines += "  - INSERT文の数: $($Inserts.Count)"
     $lines += "  - UPDATE文の数: $($Updates.Count)"
+    $lines += "  - 検出した変数代入: $VariableCount 件"
     $lines += ""
 
     $allTables = @()
@@ -669,16 +902,26 @@ foreach ($sqlFile in $sqlFiles) {
         $content = ""
         $bytes = [System.IO.File]::ReadAllBytes($sqlFile.FullName)
 
-        # SJIS (Shift-JIS / cp932) を優先的に試す
         $sjis = [System.Text.Encoding]::GetEncoding(932)
         $utf8 = [System.Text.Encoding]::UTF8
 
-        # UTF-8 BOMチェック
         if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            # UTF-8 with BOM
             $content = $utf8.GetString($bytes, 3, $bytes.Length - 3)
         } else {
-            # SJISとして読み込む（日本語Windows環境）
-            $content = $sjis.GetString($bytes)
+            # Try UTF-8 first (check for invalid sequences)
+            $isValidUtf8 = $true
+            try {
+                $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+                $content = $utf8Strict.GetString($bytes)
+            } catch {
+                $isValidUtf8 = $false
+            }
+
+            if (-not $isValidUtf8) {
+                # Fall back to SJIS
+                $content = $sjis.GetString($bytes)
+            }
         }
 
         if (!$content) {
@@ -686,18 +929,22 @@ foreach ($sqlFile in $sqlFiles) {
             continue
         }
 
-        $content = [regex]::Replace($content, "--[^\r\n]*", "")
-        $content = [regex]::Replace($content, "/\*[\s\S]*?\*/", "")
-        $content = [regex]::Replace($content, "\s+", " ")
+        # 変数代入を先に解析
+        Parse-Assignments -Content $content
 
-        $insertStmts = Get-SQLStatements -Content $content -Keyword "INSERT INTO"
+        # コメント削除
+        $contentClean = [regex]::Replace($content, "--[^\r\n]*", "")
+        $contentClean = [regex]::Replace($contentClean, "/\*[\s\S]*?\*/", "")
+        $contentClean = [regex]::Replace($contentClean, "\s+", " ")
+
+        $insertStmts = Get-SQLStatements -Content $contentClean -Keyword "INSERT INTO"
         $inserts = @()
         foreach ($stmt in $insertStmts) {
             $ins = Parse-InsertStatement -Statement $stmt
             $inserts += $ins
         }
 
-        $updateStmts = Get-SQLStatements -Content $content -Keyword "UPDATE"
+        $updateStmts = Get-SQLStatements -Content $contentClean -Keyword "UPDATE"
         $updates = @()
         foreach ($stmt in $updateStmts) {
             $upd = @{
@@ -708,9 +955,8 @@ foreach ($sqlFile in $sqlFiles) {
             $updates += $upd
         }
 
-        $report = Generate-Report -Inserts $inserts -Updates $updates -FileName $sqlFile.Name
+        $report = Generate-Report -Inserts $inserts -Updates $updates -FileName $sqlFile.Name -VariableCount $script:VariableMap.Count
 
-        # 出力ファイル（UTF-8 BOM付きで保存 - Windowsメモ帳対応）
         $outFile = Join-Path $outDir ($sqlFile.BaseName + "_report.txt")
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)
         [System.IO.File]::WriteAllText($outFile, $report, $utf8Bom)
@@ -718,7 +964,6 @@ foreach ($sqlFile in $sqlFiles) {
         Write-Host "完了! 出力先: $outFile" -ForegroundColor Green
         Write-Log "Done: $outFile"
 
-        # コンソール出力（SJISで出力）
         Write-Host ""
         $sjisOut = [System.Text.Encoding]::GetEncoding(932)
         [Console]::OutputEncoding = $sjisOut
