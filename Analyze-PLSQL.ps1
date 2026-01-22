@@ -132,6 +132,206 @@ function Get-Columns {
     return $cols
 }
 
+# 括弧を考慮してカンマで分割
+function Split-ByComma {
+    param([string]$Text)
+
+    $items = @()
+    $current = ""
+    $depth = 0
+
+    foreach ($c in $Text.ToCharArray()) {
+        if ($c -eq '(') { $depth++ }
+        elseif ($c -eq ')') { $depth-- }
+
+        if ($c -eq ',' -and $depth -eq 0) {
+            if ($current.Trim()) { $items += $current.Trim() }
+            $current = ""
+        } else {
+            $current += $c
+        }
+    }
+    if ($current.Trim()) { $items += $current.Trim() }
+
+    return $items
+}
+
+# VALUES部分の値を取得
+function Get-ValuesContent {
+    param([string]$Statement)
+
+    $upper = $Statement.ToUpper()
+    $valIdx = $upper.IndexOf("VALUES")
+    if ($valIdx -lt 0) { return @() }
+
+    # VALUES後の最初の(を探す
+    $lpIdx = $Statement.IndexOf("(", $valIdx)
+    if ($lpIdx -lt 0) { return @() }
+
+    # 対応する)を探す
+    $depth = 1
+    $rpIdx = -1
+    for ($i = $lpIdx + 1; $i -lt $Statement.Length; $i++) {
+        if ($Statement[$i] -eq '(') { $depth++ }
+        elseif ($Statement[$i] -eq ')') {
+            $depth--
+            if ($depth -eq 0) {
+                $rpIdx = $i
+                break
+            }
+        }
+    }
+
+    if ($rpIdx -gt $lpIdx) {
+        $valStr = $Statement.Substring($lpIdx + 1, $rpIdx - $lpIdx - 1)
+        return Split-ByComma -Text $valStr
+    }
+
+    return @()
+}
+
+# SELECT部分の値を取得
+function Get-SelectColumns {
+    param([string]$Statement)
+
+    $upper = $Statement.ToUpper()
+    $selIdx = $upper.IndexOf("SELECT")
+    if ($selIdx -lt 0) { return @() }
+
+    $fromIdx = $upper.IndexOf(" FROM ", $selIdx)
+    if ($fromIdx -lt 0) { return @() }
+
+    $selPart = $Statement.Substring($selIdx + 6, $fromIdx - $selIdx - 6).Trim()
+    return Split-ByComma -Text $selPart
+}
+
+# CASE文を解析して説明文字列を生成
+function Format-CaseExpression {
+    param([string]$Expr)
+
+    $upper = $Expr.ToUpper()
+    if (-not $upper.Contains("CASE")) { return $null }
+
+    $result = @()
+
+    $caseIdx = $upper.IndexOf("CASE WHEN")
+    if ($caseIdx -lt 0) { return $null }
+
+    $endIdx = $upper.IndexOf(" END", $caseIdx)
+    if ($endIdx -lt 0) { $endIdx = $upper.IndexOf("END,", $caseIdx) }
+    if ($endIdx -lt 0) { $endIdx = $upper.IndexOf("END)", $caseIdx) }
+    if ($endIdx -lt 0) { return $null }
+
+    $caseExpr = $Expr.Substring($caseIdx, $endIdx - $caseIdx + 4)
+    $caseUpper = $caseExpr.ToUpper()
+
+    $whenIdx = 0
+    while ($true) {
+        $wIdx = $caseUpper.IndexOf("WHEN ", $whenIdx)
+        if ($wIdx -lt 0) { break }
+
+        $tIdx = $caseUpper.IndexOf(" THEN ", $wIdx)
+        if ($tIdx -lt 0) { break }
+
+        $condition = $caseExpr.Substring($wIdx + 5, $tIdx - $wIdx - 5).Trim()
+
+        $valueStart = $tIdx + 6
+        $valueEnd = $caseExpr.Length
+
+        $nextWhen = $caseUpper.IndexOf("WHEN ", $valueStart)
+        $nextElse = $caseUpper.IndexOf("ELSE ", $valueStart)
+        $nextEnd = $caseUpper.IndexOf("END", $valueStart)
+
+        if ($nextWhen -gt 0 -and $nextWhen -lt $valueEnd) { $valueEnd = $nextWhen }
+        if ($nextElse -gt 0 -and $nextElse -lt $valueEnd) { $valueEnd = $nextElse }
+        if ($nextEnd -gt 0 -and $nextEnd -lt $valueEnd) { $valueEnd = $nextEnd }
+
+        $value = $caseExpr.Substring($valueStart, $valueEnd - $valueStart).Trim().Trim("'", " ", ",")
+
+        $result += "[$condition] -> [$value]"
+        $whenIdx = $tIdx + 6
+    }
+
+    $elseIdx = $caseUpper.IndexOf("ELSE ")
+    if ($elseIdx -gt 0) {
+        $endKeyword = $caseUpper.IndexOf("END", $elseIdx)
+        if ($endKeyword -gt $elseIdx) {
+            $elseValue = $caseExpr.Substring($elseIdx + 5, $endKeyword - $elseIdx - 5).Trim().Trim("'", " ")
+            $result += "[その他] -> [$elseValue]"
+        }
+    }
+
+    return $result
+}
+
+# 値の説明を生成
+function Format-ValueDescription {
+    param([string]$Value)
+
+    $val = $Value.Trim()
+    $upper = $val.ToUpper()
+
+    # CASE文
+    if ($upper.Contains("CASE WHEN")) {
+        $caseLines = Format-CaseExpression -Expr $val
+        if ($caseLines) {
+            return @{ Type = "CASE"; Lines = $caseLines }
+        }
+    }
+
+    # シーケンス
+    if ($upper.Contains(".NEXTVAL")) {
+        return @{ Type = "SIMPLE"; Text = "(シーケンス自動採番)" }
+    }
+
+    # SYSDATE/SYSTIMESTAMP
+    if ($upper -eq "SYSDATE" -or $upper -eq "SYSTIMESTAMP") {
+        return @{ Type = "SIMPLE"; Text = "(現在日時)" }
+    }
+
+    # NVL
+    if ($upper.StartsWith("NVL(")) {
+        return @{ Type = "SIMPLE"; Text = $val + " (NULLの場合はデフォルト値)" }
+    }
+
+    # 関数呼び出し (SUM, COUNT, AVG, ROUND, TO_CHAR等)
+    if ($upper -match "^(SUM|COUNT|AVG|ROUND|TO_CHAR|TRUNC|MAX|MIN)\s*\(") {
+        return @{ Type = "SIMPLE"; Text = $val }
+    }
+
+    # テーブル.カラム形式
+    if ($val -match "^[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_\u3000-\u9FFF][a-zA-Z0-9_\u3000-\u9FFF]*$") {
+        return @{ Type = "SIMPLE"; Text = $val + " から取得" }
+    }
+
+    # 計算式 (例: od.数量 * p.単価)
+    if ($val -match "\*|\+|\-|\/") {
+        return @{ Type = "SIMPLE"; Text = $val + " (計算)" }
+    }
+
+    # 文字列リテラル
+    if ($val.StartsWith("'") -and $val.EndsWith("'")) {
+        return @{ Type = "SIMPLE"; Text = "固定値: $val" }
+    }
+
+    # 数値リテラル
+    if ($val -match "^\d+$") {
+        return @{ Type = "SIMPLE"; Text = "固定値: $val" }
+    }
+
+    # 変数 (v_で始まる)
+    if ($val -match "^v_") {
+        return @{ Type = "SIMPLE"; Text = "変数: $val" }
+    }
+
+    # エイリアス付きカラム (例: c.顧客ID)
+    if ($val -match "^[a-zA-Z]+\..+$") {
+        return @{ Type = "SIMPLE"; Text = $val + " から取得" }
+    }
+
+    return @{ Type = "SIMPLE"; Text = $val }
+}
+
 function Get-ValueSource {
     param([string]$Statement)
 
@@ -217,6 +417,11 @@ function Get-WhereConditions {
 
     if ($whereIdx -ge 0) {
         $wherePart = $Statement.Substring($whereIdx + 6)
+        # GROUP BYやORDER BYがあればそこまで
+        $groupIdx = $wherePart.ToUpper().IndexOf(" GROUP BY")
+        $orderIdx = $wherePart.ToUpper().IndexOf(" ORDER BY")
+        if ($groupIdx -gt 0) { $wherePart = $wherePart.Substring(0, $groupIdx) }
+        if ($orderIdx -gt 0) { $wherePart = $wherePart.Substring(0, $orderIdx) }
         $wherePart = $wherePart.TrimEnd(';', ' ')
 
         $parts = $wherePart -split "\sAND\s"
@@ -229,69 +434,6 @@ function Get-WhereConditions {
     }
 
     return $conditions
-}
-
-function Get-CaseLogic {
-    param([string]$Statement)
-
-    $logic = @()
-    $upper = $Statement.ToUpper()
-
-    $caseIdx = 0
-    while ($true) {
-        $idx = $upper.IndexOf("CASE WHEN", $caseIdx)
-        if ($idx -lt 0) { break }
-
-        $endIdx = $upper.IndexOf(" END", $idx)
-        if ($endIdx -lt 0) { $endIdx = $upper.IndexOf("END,", $idx) }
-        if ($endIdx -lt 0) { $endIdx = $upper.IndexOf("END)", $idx) }
-        if ($endIdx -lt 0) { break }
-
-        $caseExpr = $Statement.Substring($idx, $endIdx - $idx + 4)
-
-        $whenIdx = 0
-        $caseUpper = $caseExpr.ToUpper()
-        while ($true) {
-            $wIdx = $caseUpper.IndexOf("WHEN ", $whenIdx)
-            if ($wIdx -lt 0) { break }
-
-            $tIdx = $caseUpper.IndexOf(" THEN ", $wIdx)
-            if ($tIdx -lt 0) { break }
-
-            $condition = $caseExpr.Substring($wIdx + 5, $tIdx - $wIdx - 5).Trim()
-
-            $valueStart = $tIdx + 6
-            $valueEnd = $caseExpr.Length
-
-            $nextWhen = $caseUpper.IndexOf("WHEN ", $valueStart)
-            $nextElse = $caseUpper.IndexOf("ELSE ", $valueStart)
-            $nextEnd = $caseUpper.IndexOf("END", $valueStart)
-
-            if ($nextWhen -gt 0 -and $nextWhen -lt $valueEnd) { $valueEnd = $nextWhen }
-            if ($nextElse -gt 0 -and $nextElse -lt $valueEnd) { $valueEnd = $nextElse }
-            if ($nextEnd -gt 0 -and $nextEnd -lt $valueEnd) { $valueEnd = $nextEnd }
-
-            $value = $caseExpr.Substring($valueStart, $valueEnd - $valueStart).Trim()
-            $value = $value.Trim("'", " ", ",")
-
-            $logic += @{ Condition = $condition; Value = $value }
-            $whenIdx = $tIdx + 6
-        }
-
-        $elseIdx = $caseUpper.IndexOf("ELSE ")
-        if ($elseIdx -gt 0) {
-            $endKeyword = $caseUpper.IndexOf("END", $elseIdx)
-            if ($endKeyword -gt $elseIdx) {
-                $elseValue = $caseExpr.Substring($elseIdx + 5, $endKeyword - $elseIdx - 5).Trim()
-                $elseValue = $elseValue.Trim("'", " ")
-                $logic += @{ Condition = "その他"; Value = $elseValue }
-            }
-        }
-
-        $caseIdx = $endIdx + 3
-    }
-
-    return $logic
 }
 
 function Get-SetColumns {
@@ -324,21 +466,7 @@ function Get-SetColumns {
     }
     $setPart = $setPart.TrimEnd(';', ' ')
 
-    $items = @()
-    $current = ""
-    $depth = 0
-    foreach ($c in $setPart.ToCharArray()) {
-        if ($c -eq '(') { $depth++ }
-        elseif ($c -eq ')') { $depth-- }
-
-        if ($c -eq ',' -and $depth -eq 0) {
-            if ($current.Trim()) { $items += $current.Trim() }
-            $current = ""
-        } else {
-            $current += $c
-        }
-    }
-    if ($current.Trim()) { $items += $current.Trim() }
+    $items = Split-ByComma -Text $setPart
 
     foreach ($item in $items) {
         $eqIdx = $item.IndexOf("=")
@@ -346,22 +474,63 @@ function Get-SetColumns {
             $colName = $item.Substring(0, $eqIdx).Trim()
             $colValue = $item.Substring($eqIdx + 1).Trim()
 
-            $hasSubQuery = $colValue.ToUpper().Contains("SELECT")
-            $caseLogic = @()
-            if ($colValue.ToUpper().Contains("CASE WHEN")) {
-                $caseLogic = Get-CaseLogic -Statement $colValue
-            }
+            $valueDesc = Format-ValueDescription -Value $colValue
 
             $columns += @{
                 Column = $colName
                 Value = $colValue
-                HasSubQuery = $hasSubQuery
-                Logic = $caseLogic
+                ValueDesc = $valueDesc
             }
         }
     }
 
     return $columns
+}
+
+# INSERT文を解析
+function Parse-InsertStatement {
+    param([string]$Statement)
+
+    $columns = Get-Columns -Statement $Statement
+    $upper = $Statement.ToUpper()
+
+    $columnDetails = @()
+
+    if ($upper.Contains("VALUES")) {
+        $values = Get-ValuesContent -Statement $Statement
+        for ($i = 0; $i -lt $columns.Count; $i++) {
+            $col = $columns[$i]
+            $val = if ($i -lt $values.Count) { $values[$i] } else { "" }
+            $valueDesc = Format-ValueDescription -Value $val
+
+            $columnDetails += @{
+                Column = $col
+                Value = $val
+                ValueDesc = $valueDesc
+            }
+        }
+    } elseif ($upper.Contains("SELECT")) {
+        $selectCols = Get-SelectColumns -Statement $Statement
+        for ($i = 0; $i -lt $columns.Count; $i++) {
+            $col = $columns[$i]
+            $val = if ($i -lt $selectCols.Count) { $selectCols[$i] } else { "" }
+            $valueDesc = Format-ValueDescription -Value $val
+
+            $columnDetails += @{
+                Column = $col
+                Value = $val
+                ValueDesc = $valueDesc
+            }
+        }
+    }
+
+    return @{
+        TableName = Get-TableName -Statement $Statement -Keyword "INSERT"
+        ColumnDetails = $columnDetails
+        ValueSource = Get-ValueSource -Statement $Statement
+        SourceTables = @(Get-SourceTables -Statement $Statement)
+        Conditions = @(Get-WhereConditions -Statement $Statement)
+    }
 }
 
 function Generate-Report {
@@ -406,20 +575,10 @@ function Generate-Report {
             $lines += "-" * 60
             $lines += ""
             $lines += "対象テーブル: $($ins.TableName)"
-            $lines += ""
-            $lines += "挿入カラム:"
-            foreach ($c in $ins.Columns) {
-                $lines += "  - $c"
-            }
-            $lines += ""
             $lines += "データ取得元: $($ins.ValueSource)"
 
             if ($ins.SourceTables.Count -gt 0) {
-                $lines += ""
-                $lines += "参照テーブル:"
-                foreach ($t in $ins.SourceTables) {
-                    $lines += "  - $t"
-                }
+                $lines += "参照テーブル: " + ($ins.SourceTables -join ", ")
             }
 
             if ($ins.Conditions.Count -gt 0) {
@@ -430,15 +589,23 @@ function Generate-Report {
                 }
             }
 
-            if ($ins.CaseLogic.Count -gt 0) {
-                $lines += ""
-                $lines += "条件分岐 (CASE):"
-                foreach ($l in $ins.CaseLogic) {
-                    $lines += "  - [$($l.Condition)] の場合 -> [$($l.Value)]"
+            $lines += ""
+            $lines += "カラム詳細:"
+            $lines += ""
+
+            foreach ($col in $ins.ColumnDetails) {
+                $lines += "  [$($col.Column)]"
+                if ($col.ValueDesc.Type -eq "CASE") {
+                    $lines += "    条件分岐:"
+                    foreach ($caseLine in $col.ValueDesc.Lines) {
+                        $lines += "      $caseLine"
+                    }
+                } else {
+                    $lines += "    <- $($col.ValueDesc.Text)"
                 }
+                $lines += ""
             }
 
-            $lines += ""
             $num++
         }
     }
@@ -456,23 +623,6 @@ function Generate-Report {
             $lines += "-" * 60
             $lines += ""
             $lines += "対象テーブル: $($upd.TableName)"
-            $lines += ""
-            $lines += "更新カラム:"
-
-            foreach ($col in $upd.SetColumns) {
-                $lines += ""
-                $lines += "  カラム名: $($col.Column)"
-                if ($col.Logic.Count -gt 0) {
-                    $lines += "  更新ロジック:"
-                    foreach ($l in $col.Logic) {
-                        $lines += "    - [$($l.Condition)] の場合 -> [$($l.Value)]"
-                    }
-                } elseif ($col.HasSubQuery) {
-                    $lines += "  新しい値: (サブクエリで計算)"
-                } else {
-                    $lines += "  新しい値: $($col.Value)"
-                }
-            }
 
             if ($upd.Conditions.Count -gt 0) {
                 $lines += ""
@@ -483,6 +633,22 @@ function Generate-Report {
             }
 
             $lines += ""
+            $lines += "更新カラム:"
+            $lines += ""
+
+            foreach ($col in $upd.SetColumns) {
+                $lines += "  [$($col.Column)]"
+                if ($col.ValueDesc.Type -eq "CASE") {
+                    $lines += "    条件分岐:"
+                    foreach ($caseLine in $col.ValueDesc.Lines) {
+                        $lines += "      $caseLine"
+                    }
+                } else {
+                    $lines += "    <- $($col.ValueDesc.Text)"
+                }
+                $lines += ""
+            }
+
             $num++
         }
     }
@@ -520,14 +686,7 @@ foreach ($sqlFile in $sqlFiles) {
         $insertStmts = Get-SQLStatements -Content $content -Keyword "INSERT INTO"
         $inserts = @()
         foreach ($stmt in $insertStmts) {
-            $ins = @{
-                TableName = Get-TableName -Statement $stmt -Keyword "INSERT"
-                Columns = @(Get-Columns -Statement $stmt)
-                ValueSource = Get-ValueSource -Statement $stmt
-                SourceTables = @(Get-SourceTables -Statement $stmt)
-                Conditions = @(Get-WhereConditions -Statement $stmt)
-                CaseLogic = @(Get-CaseLogic -Statement $stmt)
-            }
+            $ins = Parse-InsertStatement -Statement $stmt
             $inserts += $ins
         }
 
