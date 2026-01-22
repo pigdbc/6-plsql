@@ -667,11 +667,18 @@ foreach ($sqlFile in $sqlFiles) {
 
     try {
         $content = ""
-        try {
-            $bytes = [System.IO.File]::ReadAllBytes($sqlFile.FullName)
-            $content = [System.Text.Encoding]::UTF8.GetString($bytes)
-        } catch {
-            $content = Get-Content -Path $sqlFile.FullName -Raw -Encoding Default
+        $bytes = [System.IO.File]::ReadAllBytes($sqlFile.FullName)
+
+        # SJIS (Shift-JIS / cp932) を優先的に試す
+        $sjis = [System.Text.Encoding]::GetEncoding(932)
+        $utf8 = [System.Text.Encoding]::UTF8
+
+        # UTF-8 BOMチェック
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            $content = $utf8.GetString($bytes, 3, $bytes.Length - 3)
+        } else {
+            # SJISとして読み込む（日本語Windows環境）
+            $content = $sjis.GetString($bytes)
         }
 
         if (!$content) {
@@ -703,13 +710,18 @@ foreach ($sqlFile in $sqlFiles) {
 
         $report = Generate-Report -Inserts $inserts -Updates $updates -FileName $sqlFile.Name
 
+        # 出力ファイル（UTF-8 BOM付きで保存 - Windowsメモ帳対応）
         $outFile = Join-Path $outDir ($sqlFile.BaseName + "_report.txt")
-        [System.IO.File]::WriteAllText($outFile, $report, [System.Text.Encoding]::UTF8)
+        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        [System.IO.File]::WriteAllText($outFile, $report, $utf8Bom)
 
         Write-Host "完了! 出力先: $outFile" -ForegroundColor Green
         Write-Log "Done: $outFile"
 
+        # コンソール出力（SJISで出力）
         Write-Host ""
+        $sjisOut = [System.Text.Encoding]::GetEncoding(932)
+        [Console]::OutputEncoding = $sjisOut
         Write-Host $report
 
     } catch {
