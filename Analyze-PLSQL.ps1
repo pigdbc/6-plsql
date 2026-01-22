@@ -1,603 +1,602 @@
-# ============================================
-# PL/SQL 分析工具
-# 用于分析日语PL/SQL文件中的INSERT和UPDATE操作
-# ============================================
+<#
+.SYNOPSIS
+    PL/SQL 分析工具 - 分析日语SQL代码中的INSERT和UPDATE操作
+.DESCRIPTION
+    兼容 Windows PowerShell 5.1 和 PowerShell Core
+#>
 
 param(
     [Parameter(Mandatory=$false)]
     [string]$FileName = ""
 )
 
-$ErrorActionPreference = "Stop"
+# 设置编码
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
+
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $inDir = Join-Path $scriptPath "in"
 $outDir = Join-Path $scriptPath "out"
 $logDir = Join-Path $scriptPath "log"
 
-# 确保输出目录存在
-@($outDir, $logDir) | ForEach-Object {
-    if (-not (Test-Path $_)) {
-        New-Item -ItemType Directory -Path $_ -Force | Out-Null
+# 确保目录存在
+foreach ($dir in @($outDir, $logDir)) {
+    if (!(Test-Path $dir)) {
+        $null = New-Item -ItemType Directory -Path $dir -Force
     }
 }
 
-# 获取要处理的文件
+# 获取SQL文件
 if ($FileName) {
-    $sqlFiles = @(Get-ChildItem -Path $inDir -Filter $FileName -ErrorAction SilentlyContinue)
+    $sqlFiles = Get-ChildItem -Path $inDir -Filter $FileName -ErrorAction SilentlyContinue
 } else {
-    $sqlFiles = @(Get-ChildItem -Path $inDir -Filter "*.sql" -ErrorAction SilentlyContinue)
+    $sqlFiles = Get-ChildItem -Path $inDir -Filter "*.sql" -ErrorAction SilentlyContinue
 }
 
-if ($sqlFiles.Count -eq 0) {
+if (!$sqlFiles) {
     Write-Host "未找到SQL文件。请将.sql文件放入 in/ 目录。" -ForegroundColor Yellow
     exit 1
 }
 
-# 日志函数
-$logFile = Join-Path $logDir "analyze_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-function Write-Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$timestamp - $Message" | Out-File -FilePath $logFile -Append -Encoding UTF8
+# 日志
+$logFile = Join-Path $logDir ("analyze_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + ".log")
+function Write-Log($msg) {
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFile -Value "$ts - $msg" -Encoding UTF8
 }
 
-# 解析INSERT语句
-function Parse-InsertStatement {
-    param([string]$Statement)
+# 提取语句（处理分号结尾）
+function Get-SQLStatements {
+    param([string]$Content, [string]$Keyword)
 
-    $result = @{
-        TableName = ""
-        Columns = @()
-        ValueSource = ""
-        Conditions = @()
-        CaseLogic = @()
+    $statements = @()
+    $pattern = "$Keyword\s+"
+    $startPos = 0
+
+    while ($true) {
+        $idx = $Content.ToUpper().IndexOf($Keyword.ToUpper(), $startPos)
+        if ($idx -lt 0) { break }
+
+        # 找分号
+        $endPos = $Content.IndexOf(";", $idx)
+        if ($endPos -lt 0) { $endPos = $Content.Length - 1 }
+
+        $stmt = $Content.Substring($idx, $endPos - $idx + 1)
+        $statements += $stmt
+        $startPos = $endPos + 1
     }
 
-    # 提取表名 - 支持 INSERT INTO schema.table 格式
-    if ($Statement -match "INSERT\s+INTO\s+([^\s(]+)") {
-        $result.TableName = $Matches[1]
-    }
-
-    # 提取列名
-    if ($Statement -match "INSERT\s+INTO\s+[^\s(]+\s*\(([^)]+)\)") {
-        $columnsPart = $Matches[1]
-        $result.Columns = $columnsPart -split "," | ForEach-Object { $_.Trim() }
-    }
-
-    # 判断是VALUES还是SELECT
-    if ($Statement -match "VALUES\s*\(") {
-        $result.ValueSource = "直接指定值"
-
-        # 提取VALUES部分
-        if ($Statement -match "VALUES\s*\((.+)\)\s*;?\s*$") {
-            $valuesPart = $Matches[1]
-            # 解析CASE语句
-            $caseMatches = [regex]::Matches($valuesPart, "CASE\s+WHEN\s+(.+?)\s+END", [System.Text.RegularExpressions.RegexOptions]::Singleline)
-            foreach ($case in $caseMatches) {
-                $caseContent = $case.Groups[1].Value
-                # 提取每个WHEN条件
-                $whenMatches = [regex]::Matches($caseContent, "WHEN\s+(.+?)\s+THEN\s+([^\s]+)")
-                foreach ($when in $whenMatches) {
-                    $result.CaseLogic += @{
-                        Condition = $when.Groups[1].Value.Trim()
-                        Value = $when.Groups[2].Value.Trim()
-                    }
-                }
-                # 提取ELSE
-                if ($caseContent -match "ELSE\s+([^\s]+)") {
-                    $result.CaseLogic += @{
-                        Condition = "其他情况"
-                        Value = $Matches[1].Trim()
-                    }
-                }
-            }
-        }
-    } elseif ($Statement -match "SELECT") {
-        $result.ValueSource = "从其他表查询"
-
-        # 提取FROM子句中的表
-        $fromMatches = [regex]::Matches($Statement, "FROM\s+([^\s]+)")
-        $joinMatches = [regex]::Matches($Statement, "(?:INNER\s+)?JOIN\s+([^\s]+)")
-
-        $sourceTables = @()
-        foreach ($m in $fromMatches) {
-            $sourceTables += $m.Groups[1].Value
-        }
-        foreach ($m in $joinMatches) {
-            $sourceTables += $m.Groups[1].Value
-        }
-        $result.SourceTables = $sourceTables | Select-Object -Unique
-
-        # 提取WHERE条件
-        if ($Statement -match "WHERE\s+(.+?)(?:GROUP|ORDER|;|\s*$)") {
-            $wherePart = $Matches[1]
-            $conditions = $wherePart -split "\s+AND\s+" | ForEach-Object { $_.Trim() }
-            $result.Conditions = $conditions
-        }
-
-        # 提取CASE逻辑
-        $caseMatches = [regex]::Matches($Statement, "CASE\s+WHEN\s+(.+?)\s+END", [System.Text.RegularExpressions.RegexOptions]::Singleline)
-        foreach ($case in $caseMatches) {
-            $caseContent = $case.Groups[1].Value
-            $whenMatches = [regex]::Matches($caseContent, "WHEN\s+(.+?)\s+THEN\s+'?([^']+)'?(?=\s+(?:WHEN|ELSE|END))")
-            foreach ($when in $whenMatches) {
-                $result.CaseLogic += @{
-                    Condition = $when.Groups[1].Value.Trim()
-                    Value = $when.Groups[2].Value.Trim()
-                }
-            }
-            if ($caseContent -match "ELSE\s+'?([^']+)'?") {
-                $result.CaseLogic += @{
-                    Condition = "其他情况"
-                    Value = $Matches[1].Trim()
-                }
-            }
-        }
-    }
-
-    return $result
+    return $statements
 }
 
-# 提取平衡括号内的内容
-function Get-BalancedContent {
-    param(
-        [string]$Text,
-        [int]$StartIndex
-    )
+# 提取表名
+function Get-TableName {
+    param([string]$Statement, [string]$Keyword)
 
-    $depth = 0
-    $start = $StartIndex
-    $result = ""
-
-    for ($i = $StartIndex; $i -lt $Text.Length; $i++) {
-        $char = $Text[$i]
-        if ($char -eq '(') { $depth++ }
-        if ($char -eq ')') {
-            $depth--
-            if ($depth -eq 0) {
-                return $Text.Substring($StartIndex, $i - $StartIndex + 1)
-            }
-        }
-    }
-    return $Text.Substring($StartIndex)
-}
-
-# 智能分割SET子句（考虑括号嵌套）
-function Split-SetClause {
-    param([string]$SetPart)
-
-    $items = @()
-    $currentItem = ""
-    $parenDepth = 0
-
-    foreach ($char in $SetPart.ToCharArray()) {
-        if ($char -eq '(') { $parenDepth++ }
-        if ($char -eq ')') { $parenDepth-- }
-
-        if ($char -eq ',' -and $parenDepth -eq 0) {
-            if ($currentItem.Trim()) {
-                $items += $currentItem.Trim()
-            }
-            $currentItem = ""
-        } else {
-            $currentItem += $char
-        }
-    }
-    if ($currentItem.Trim()) {
-        $items += $currentItem.Trim()
-    }
-
-    return $items
-}
-
-# 简化子查询显示
-function Simplify-SubQuery {
-    param([string]$Text)
-
-    $result = $Text
-    $startIndex = 0
-
-    while (($selectPos = $result.IndexOf("(SELECT", $startIndex)) -ge 0) {
-        # 找到匹配的右括号
-        $depth = 0
-        $endPos = -1
-
-        for ($i = $selectPos; $i -lt $result.Length; $i++) {
-            if ($result[$i] -eq '(') { $depth++ }
-            if ($result[$i] -eq ')') {
-                $depth--
-                if ($depth -eq 0) {
-                    $endPos = $i
+    $upper = $Statement.ToUpper()
+    if ($Keyword -eq "INSERT") {
+        $idx = $upper.IndexOf("INSERT INTO")
+        if ($idx -ge 0) {
+            $rest = $Statement.Substring($idx + 11).TrimStart()
+            $endIdx = 0
+            for ($i = 0; $i -lt $rest.Length; $i++) {
+                $c = $rest[$i]
+                if ($c -eq ' ' -or $c -eq '(' -or $c -eq "`t" -or $c -eq "`n" -or $c -eq "`r") {
+                    $endIdx = $i
                     break
                 }
+                $endIdx = $i + 1
             }
+            return $rest.Substring(0, $endIdx)
         }
-
-        if ($endPos -gt $selectPos) {
-            $subQuery = $result.Substring($selectPos, $endPos - $selectPos + 1)
-
-            # 提取表名
-            if ($subQuery -match "FROM\s+([^\s\)]+)") {
-                $tableName = $Matches[1]
-                $replacement = "(子查询:从${tableName}获取)"
-                $result = $result.Substring(0, $selectPos) + $replacement + $result.Substring($endPos + 1)
-                $startIndex = $selectPos + $replacement.Length
-            } else {
-                $startIndex = $endPos + 1
+    } elseif ($Keyword -eq "UPDATE") {
+        $idx = $upper.IndexOf("UPDATE")
+        if ($idx -ge 0) {
+            $rest = $Statement.Substring($idx + 6).TrimStart()
+            $endIdx = 0
+            for ($i = 0; $i -lt $rest.Length; $i++) {
+                $c = $rest[$i]
+                if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`n" -or $c -eq "`r") {
+                    $endIdx = $i
+                    break
+                }
+                $endIdx = $i + 1
             }
-        } else {
-            break
+            return $rest.Substring(0, $endIdx)
         }
     }
-
-    return $result
+    return ""
 }
 
-# 解析CASE表达式
-function Parse-CaseExpression {
-    param([string]$CaseExpr)
+# 提取括号内列名
+function Get-Columns {
+    param([string]$Statement)
 
-    $logic = @()
+    $cols = @()
+    $upper = $Statement.ToUpper()
+    $intoIdx = $upper.IndexOf("INTO")
+    if ($intoIdx -lt 0) { return $cols }
 
-    # 匹配 WHEN ... THEN ... 模式
-    $whenPattern = "WHEN\s+(.+?)\s+THEN\s+'?([^']+?)'?(?=\s+(?:WHEN|ELSE|END))"
-    $whenMatches = [regex]::Matches($CaseExpr, $whenPattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    # 找第一个左括号
+    $lpIdx = $Statement.IndexOf("(", $intoIdx)
+    if ($lpIdx -lt 0) { return $cols }
 
-    foreach ($when in $whenMatches) {
-        $condition = $when.Groups[1].Value.Trim()
-        $value = $when.Groups[2].Value.Trim()
-
-        # 简化子查询显示
-        $condition = Simplify-SubQuery -Text $condition
-
-        $logic += @{
-            Condition = $condition
-            Value = $value
+    # 找匹配的右括号
+    $depth = 1
+    $rpIdx = -1
+    for ($i = $lpIdx + 1; $i -lt $Statement.Length; $i++) {
+        if ($Statement[$i] -eq '(') { $depth++ }
+        elseif ($Statement[$i] -eq ')') {
+            $depth--
+            if ($depth -eq 0) {
+                $rpIdx = $i
+                break
+            }
         }
     }
 
-    # 提取ELSE
-    if ($CaseExpr -match "ELSE\s+'?([^']+?)'?\s*END") {
-        $logic += @{
-            Condition = "其他情况"
-            Value = $Matches[1].Trim()
+    if ($rpIdx -gt $lpIdx) {
+        $colStr = $Statement.Substring($lpIdx + 1, $rpIdx - $lpIdx - 1)
+        $cols = $colStr -split "," | ForEach-Object { $_.Trim() }
+    }
+
+    return $cols
+}
+
+# 判断数据来源
+function Get-ValueSource {
+    param([string]$Statement)
+
+    $upper = $Statement.ToUpper()
+    if ($upper.Contains("VALUES")) {
+        return "直接指定值"
+    } elseif ($upper.Contains("SELECT")) {
+        return "从其他表查询"
+    }
+    return "未知"
+}
+
+# 提取FROM表
+function Get-SourceTables {
+    param([string]$Statement)
+
+    $tables = @()
+    $upper = $Statement.ToUpper()
+
+    # 找FROM
+    $fromIdx = 0
+    while ($true) {
+        $idx = $upper.IndexOf("FROM ", $fromIdx)
+        if ($idx -lt 0) { break }
+
+        $rest = $Statement.Substring($idx + 5).TrimStart()
+        $endIdx = 0
+        for ($i = 0; $i -lt $rest.Length; $i++) {
+            $c = $rest[$i]
+            if ($c -eq ' ' -or $c -eq ',' -or $c -eq "`t" -or $c -eq "`n" -or $c -eq "`r" -or $c -eq '(') {
+                $endIdx = $i
+                break
+            }
+            $endIdx = $i + 1
         }
+        $tbl = $rest.Substring(0, $endIdx)
+        if ($tbl -and $tbl.ToUpper() -ne "DUAL") {
+            $tables += $tbl
+        }
+        $fromIdx = $idx + 5
+    }
+
+    # 找JOIN
+    $joinIdx = 0
+    while ($true) {
+        $idx = $upper.IndexOf("JOIN ", $joinIdx)
+        if ($idx -lt 0) { break }
+
+        $rest = $Statement.Substring($idx + 5).TrimStart()
+        $endIdx = 0
+        for ($i = 0; $i -lt $rest.Length; $i++) {
+            $c = $rest[$i]
+            if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`n" -or $c -eq "`r") {
+                $endIdx = $i
+                break
+            }
+            $endIdx = $i + 1
+        }
+        $tbl = $rest.Substring(0, $endIdx)
+        if ($tbl) {
+            $tables += $tbl
+        }
+        $joinIdx = $idx + 5
+    }
+
+    return ($tables | Select-Object -Unique)
+}
+
+# 提取WHERE条件
+function Get-WhereConditions {
+    param([string]$Statement)
+
+    $conditions = @()
+    $upper = $Statement.ToUpper()
+
+    # 找最后一个顶级WHERE
+    $whereIdx = -1
+    $depth = 0
+    for ($i = 0; $i -lt $Statement.Length; $i++) {
+        if ($Statement[$i] -eq '(') { $depth++ }
+        elseif ($Statement[$i] -eq ')') { $depth-- }
+        elseif ($depth -eq 0 -and $i + 5 -lt $Statement.Length) {
+            if ($upper.Substring($i, 6) -eq "WHERE ") {
+                $whereIdx = $i
+            }
+        }
+    }
+
+    if ($whereIdx -ge 0) {
+        $wherePart = $Statement.Substring($whereIdx + 6)
+        # 移除末尾分号
+        $wherePart = $wherePart.TrimEnd(';', ' ')
+
+        # 按AND分割（简单处理）
+        $parts = $wherePart -split "\sAND\s"
+        foreach ($p in $parts) {
+            $trimmed = $p.Trim()
+            if ($trimmed) {
+                $conditions += $trimmed
+            }
+        }
+    }
+
+    return $conditions
+}
+
+# 提取CASE逻辑
+function Get-CaseLogic {
+    param([string]$Statement)
+
+    $logic = @()
+    $upper = $Statement.ToUpper()
+
+    $caseIdx = 0
+    while ($true) {
+        $idx = $upper.IndexOf("CASE WHEN", $caseIdx)
+        if ($idx -lt 0) { break }
+
+        # 找END
+        $endIdx = $upper.IndexOf(" END", $idx)
+        if ($endIdx -lt 0) { $endIdx = $upper.IndexOf("END,", $idx) }
+        if ($endIdx -lt 0) { $endIdx = $upper.IndexOf("END)", $idx) }
+        if ($endIdx -lt 0) { break }
+
+        $caseExpr = $Statement.Substring($idx, $endIdx - $idx + 4)
+
+        # 提取WHEN...THEN
+        $whenIdx = 0
+        $caseUpper = $caseExpr.ToUpper()
+        while ($true) {
+            $wIdx = $caseUpper.IndexOf("WHEN ", $whenIdx)
+            if ($wIdx -lt 0) { break }
+
+            $tIdx = $caseUpper.IndexOf(" THEN ", $wIdx)
+            if ($tIdx -lt 0) { break }
+
+            $condition = $caseExpr.Substring($wIdx + 5, $tIdx - $wIdx - 5).Trim()
+
+            # 找值（到下一个WHEN或ELSE或END）
+            $valueStart = $tIdx + 6
+            $valueEnd = $caseExpr.Length
+
+            $nextWhen = $caseUpper.IndexOf("WHEN ", $valueStart)
+            $nextElse = $caseUpper.IndexOf("ELSE ", $valueStart)
+            $nextEnd = $caseUpper.IndexOf("END", $valueStart)
+
+            if ($nextWhen -gt 0 -and $nextWhen -lt $valueEnd) { $valueEnd = $nextWhen }
+            if ($nextElse -gt 0 -and $nextElse -lt $valueEnd) { $valueEnd = $nextElse }
+            if ($nextEnd -gt 0 -and $nextEnd -lt $valueEnd) { $valueEnd = $nextEnd }
+
+            $value = $caseExpr.Substring($valueStart, $valueEnd - $valueStart).Trim()
+            $value = $value.Trim("'", " ", ",")
+
+            $logic += @{ Condition = $condition; Value = $value }
+            $whenIdx = $tIdx + 6
+        }
+
+        # 提取ELSE
+        $elseIdx = $caseUpper.IndexOf("ELSE ")
+        if ($elseIdx -gt 0) {
+            $endKeyword = $caseUpper.IndexOf("END", $elseIdx)
+            if ($endKeyword -gt $elseIdx) {
+                $elseValue = $caseExpr.Substring($elseIdx + 5, $endKeyword - $elseIdx - 5).Trim()
+                $elseValue = $elseValue.Trim("'", " ")
+                $logic += @{ Condition = "其他情况"; Value = $elseValue }
+            }
+        }
+
+        $caseIdx = $endIdx + 3
     }
 
     return $logic
 }
 
-# 解析UPDATE语句
-function Parse-UpdateStatement {
+# 提取SET列
+function Get-SetColumns {
     param([string]$Statement)
 
-    $result = @{
-        TableName = ""
-        SetColumns = @()
-        Conditions = @()
-        CaseLogic = @()
-        SubQueries = @()
-    }
+    $columns = @()
+    $upper = $Statement.ToUpper()
 
-    # 提取表名
-    if ($Statement -match "UPDATE\s+([^\s]+)") {
-        $result.TableName = $Matches[1]
-    }
+    $setIdx = $upper.IndexOf(" SET ")
+    if ($setIdx -lt 0) { return $columns }
 
-    # 找到最后一个顶级WHERE的位置
-    $parenDepth = 0
-    $lastWherePos = -1
-    $setStartPos = -1
-
-    for ($i = 0; $i -lt $Statement.Length; $i++) {
-        $char = $Statement[$i]
-        if ($char -eq '(') { $parenDepth++ }
-        if ($char -eq ')') { $parenDepth-- }
-
-        if ($parenDepth -eq 0) {
-            if ($Statement.Substring($i) -match "^\s*SET\s+" -and $setStartPos -eq -1) {
-                $setStartPos = $i
-            }
-            if ($Statement.Substring($i) -match "^\s*WHERE\s+") {
-                $lastWherePos = $i
+    # 找顶级WHERE
+    $whereIdx = -1
+    $depth = 0
+    for ($i = $setIdx; $i -lt $Statement.Length; $i++) {
+        if ($Statement[$i] -eq '(') { $depth++ }
+        elseif ($Statement[$i] -eq ')') { $depth-- }
+        elseif ($depth -eq 0 -and $i + 6 -lt $Statement.Length) {
+            if ($upper.Substring($i, 6) -eq "WHERE ") {
+                $whereIdx = $i
+                break
             }
         }
     }
 
-    # 提取SET部分
-    if ($setStartPos -ge 0) {
-        $setMatch = [regex]::Match($Statement.Substring($setStartPos), "SET\s+(.+)", [System.Text.RegularExpressions.RegexOptions]::Singleline)
-        if ($setMatch.Success) {
-            $setPart = $setMatch.Groups[1].Value
+    $setPart = ""
+    if ($whereIdx -gt 0) {
+        $setPart = $Statement.Substring($setIdx + 5, $whereIdx - $setIdx - 5)
+    } else {
+        $setPart = $Statement.Substring($setIdx + 5)
+    }
+    $setPart = $setPart.TrimEnd(';', ' ')
 
-            # 如果有顶级WHERE，截取到WHERE之前
-            if ($lastWherePos -gt $setStartPos) {
-                # 计算SET内容开始位置（SET关键词后的位置）
-                $setContentStart = $setStartPos + $setMatch.Groups[1].Index
-                $whereOffset = $lastWherePos - $setContentStart
-                if ($whereOffset -gt 0 -and $whereOffset -lt $setPart.Length) {
-                    $setPart = $setPart.Substring(0, $whereOffset).Trim()
-                }
+    # 按逗号分割（考虑括号）
+    $items = @()
+    $current = ""
+    $depth = 0
+    foreach ($c in $setPart.ToCharArray()) {
+        if ($c -eq '(') { $depth++ }
+        elseif ($c -eq ')') { $depth-- }
+
+        if ($c -eq ',' -and $depth -eq 0) {
+            if ($current.Trim()) { $items += $current.Trim() }
+            $current = ""
+        } else {
+            $current += $c
+        }
+    }
+    if ($current.Trim()) { $items += $current.Trim() }
+
+    foreach ($item in $items) {
+        $eqIdx = $item.IndexOf("=")
+        if ($eqIdx -gt 0) {
+            $colName = $item.Substring(0, $eqIdx).Trim()
+            $colValue = $item.Substring($eqIdx + 1).Trim()
+
+            $hasSubQuery = $colValue.ToUpper().Contains("SELECT")
+            $caseLogic = @()
+            if ($colValue.ToUpper().Contains("CASE WHEN")) {
+                $caseLogic = Get-CaseLogic -Statement $colValue
             }
 
-            # 移除末尾分号和可能残留的WHERE
-            $setPart = $setPart -replace "\s+WHERE\s*$", ""
-            $setPart = $setPart -replace ";\s*$", ""
-
-            # 智能分割SET项
-            $setItems = Split-SetClause -SetPart $setPart
-
-            foreach ($item in $setItems) {
-                # 只匹配第一个等号
-                $eqPos = $item.IndexOf("=")
-                if ($eqPos -gt 0) {
-                    $colName = $item.Substring(0, $eqPos).Trim()
-                    $colValue = $item.Substring($eqPos + 1).Trim()
-
-                    $setInfo = @{
-                        Column = $colName
-                        Value = $colValue
-                        Logic = @()
-                        HasSubQuery = $false
-                    }
-
-                    # 检查是否包含子查询
-                    if ($colValue -match "\(SELECT\s+") {
-                        $setInfo.HasSubQuery = $true
-                        # 提取子查询信息
-                        $subQueryMatches = [regex]::Matches($colValue, "\(SELECT\s+.+?\s+FROM\s+([^\s]+)")
-                        foreach ($sq in $subQueryMatches) {
-                            $result.SubQueries += $sq.Groups[1].Value
-                        }
-                    }
-
-                    # 检查是否包含CASE
-                    if ($colValue -match "CASE\s+WHEN") {
-                        $setInfo.Logic = Parse-CaseExpression -CaseExpr $colValue
-                    }
-
-                    $result.SetColumns += $setInfo
-                }
+            $columns += @{
+                Column = $colName
+                Value = $colValue
+                HasSubQuery = $hasSubQuery
+                Logic = $caseLogic
             }
         }
     }
 
-    # 提取顶级WHERE条件
-    if ($lastWherePos -ge 0) {
-        $wherePart = $Statement.Substring($lastWherePos)
-        if ($wherePart -match "WHERE\s+(.+?)(?:;|\s*$)") {
-            $whereContent = $Matches[1]
-            # 简单分割（不在括号内的AND）
-            $conditions = @()
-            $currentCond = ""
-            $parenDepth = 0
-
-            $words = $whereContent -split "\s+"
-            for ($i = 0; $i -lt $words.Count; $i++) {
-                $word = $words[$i]
-
-                # 计算括号深度
-                $parenDepth += ($word.ToCharArray() | Where-Object { $_ -eq '(' }).Count
-                $parenDepth -= ($word.ToCharArray() | Where-Object { $_ -eq ')' }).Count
-
-                if ($word -eq "AND" -and $parenDepth -eq 0) {
-                    if ($currentCond.Trim()) {
-                        $conditions += $currentCond.Trim()
-                    }
-                    $currentCond = ""
-                } else {
-                    $currentCond += " $word"
-                }
-            }
-            if ($currentCond.Trim()) {
-                $conditions += $currentCond.Trim()
-            }
-
-            $result.Conditions = $conditions
-        }
-    }
-
-    return $result
+    return $columns
 }
 
-# 生成分析报告
+# 生成报告
 function Generate-Report {
-    param(
-        [array]$Inserts,
-        [array]$Updates,
-        [string]$FileName
-    )
+    param($Inserts, $Updates, $FileName)
 
-    $report = @()
-    $report += "=" * 80
-    $report += "PL/SQL 代码分析报告"
-    $report += "=" * 80
-    $report += ""
-    $report += "文件名: $FileName"
-    $report += "分析时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    $report += ""
-    $report += "-" * 80
-    $report += "【概要】"
-    $report += "-" * 80
-    $report += "  - INSERT 操作数: $($Inserts.Count)"
-    $report += "  - UPDATE 操作数: $($Updates.Count)"
-    $report += ""
+    $lines = @()
+    $lines += "=" * 80
+    $lines += "PL/SQL 代码分析报告"
+    $lines += "=" * 80
+    $lines += ""
+    $lines += "文件名: $FileName"
+    $lines += "分析时间: " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    $lines += ""
+    $lines += "-" * 80
+    $lines += "【概要】"
+    $lines += "-" * 80
+    $lines += "  - INSERT 操作数: $($Inserts.Count)"
+    $lines += "  - UPDATE 操作数: $($Updates.Count)"
+    $lines += ""
 
-    # 提取所有涉及的表
+    # 所有表
     $allTables = @()
-    $Inserts | ForEach-Object { $allTables += $_.TableName }
-    $Updates | ForEach-Object { $allTables += $_.TableName }
+    foreach ($i in $Inserts) { if ($i.TableName) { $allTables += $i.TableName } }
+    foreach ($u in $Updates) { if ($u.TableName) { $allTables += $u.TableName } }
     $allTables = $allTables | Select-Object -Unique
 
-    $report += "涉及的表:"
-    foreach ($table in $allTables) {
-        $report += "  - $table"
+    $lines += "涉及的表:"
+    foreach ($t in $allTables) {
+        $lines += "  - $t"
     }
-    $report += ""
+    $lines += ""
 
-    # INSERT详细信息
+    # INSERT详细
     if ($Inserts.Count -gt 0) {
-        $report += "=" * 80
-        $report += "【INSERT 操作详细】"
-        $report += "=" * 80
-        $report += ""
+        $lines += "=" * 80
+        $lines += "【INSERT 操作详细】"
+        $lines += "=" * 80
+        $lines += ""
 
-        $insertNum = 1
+        $num = 1
         foreach ($ins in $Inserts) {
-            $report += "-" * 60
-            $report += "INSERT #$insertNum"
-            $report += "-" * 60
-            $report += ""
-            $report += "目标表: $($ins.TableName)"
-            $report += ""
-            $report += "插入的列:"
-            foreach ($col in $ins.Columns) {
-                $report += "  - $col"
+            $lines += "-" * 60
+            $lines += "INSERT #$num"
+            $lines += "-" * 60
+            $lines += ""
+            $lines += "目标表: $($ins.TableName)"
+            $lines += ""
+            $lines += "插入的列:"
+            foreach ($c in $ins.Columns) {
+                $lines += "  - $c"
             }
-            $report += ""
-            $report += "数据来源: $($ins.ValueSource)"
+            $lines += ""
+            $lines += "数据来源: $($ins.ValueSource)"
 
-            if ($ins.SourceTables -and $ins.SourceTables.Count -gt 0) {
-                $report += ""
-                $report += "数据来源表:"
-                foreach ($st in $ins.SourceTables) {
-                    $report += "  - $st"
+            if ($ins.SourceTables.Count -gt 0) {
+                $lines += ""
+                $lines += "数据来源表:"
+                foreach ($t in $ins.SourceTables) {
+                    $lines += "  - $t"
                 }
             }
 
-            if ($ins.Conditions -and $ins.Conditions.Count -gt 0) {
-                $report += ""
-                $report += "筛选条件 (WHERE):"
-                foreach ($cond in $ins.Conditions) {
-                    $report += "  - $cond"
+            if ($ins.Conditions.Count -gt 0) {
+                $lines += ""
+                $lines += "筛选条件 (WHERE):"
+                foreach ($c in $ins.Conditions) {
+                    $lines += "  - $c"
                 }
             }
 
-            if ($ins.CaseLogic -and $ins.CaseLogic.Count -gt 0) {
-                $report += ""
-                $report += "条件逻辑 (CASE):"
-                foreach ($logic in $ins.CaseLogic) {
-                    $report += "  - 当 [$($logic.Condition)] 时 -> 值为 [$($logic.Value)]"
+            if ($ins.CaseLogic.Count -gt 0) {
+                $lines += ""
+                $lines += "条件逻辑 (CASE):"
+                foreach ($l in $ins.CaseLogic) {
+                    $lines += "  - 当 [$($l.Condition)] 时 -> 值为 [$($l.Value)]"
                 }
             }
 
-            $report += ""
-            $insertNum++
+            $lines += ""
+            $num++
         }
     }
 
-    # UPDATE详细信息
+    # UPDATE详细
     if ($Updates.Count -gt 0) {
-        $report += "=" * 80
-        $report += "【UPDATE 操作详细】"
-        $report += "=" * 80
-        $report += ""
+        $lines += "=" * 80
+        $lines += "【UPDATE 操作详细】"
+        $lines += "=" * 80
+        $lines += ""
 
-        $updateNum = 1
+        $num = 1
         foreach ($upd in $Updates) {
-            $report += "-" * 60
-            $report += "UPDATE #$updateNum"
-            $report += "-" * 60
-            $report += ""
-            $report += "目标表: $($upd.TableName)"
-            $report += ""
-            $report += "更新的列:"
-            foreach ($setCol in $upd.SetColumns) {
-                $report += ""
-                $report += "  列名: $($setCol.Column)"
-                if ($setCol.Logic -and $setCol.Logic.Count -gt 0) {
-                    $report += "  更新逻辑:"
-                    foreach ($logic in $setCol.Logic) {
-                        $report += "    - 当 [$($logic.Condition)] 时 -> 值为 [$($logic.Value)]"
+            $lines += "-" * 60
+            $lines += "UPDATE #$num"
+            $lines += "-" * 60
+            $lines += ""
+            $lines += "目标表: $($upd.TableName)"
+            $lines += ""
+            $lines += "更新的列:"
+
+            foreach ($col in $upd.SetColumns) {
+                $lines += ""
+                $lines += "  列名: $($col.Column)"
+                if ($col.Logic.Count -gt 0) {
+                    $lines += "  更新逻辑:"
+                    foreach ($l in $col.Logic) {
+                        $lines += "    - 当 [$($l.Condition)] 时 -> 值为 [$($l.Value)]"
                     }
-                } elseif ($setCol.HasSubQuery) {
-                    $report += "  新值: (基于子查询计算)"
-                    $report += "  详情: $($setCol.Value -replace '\s+', ' ')"
+                } elseif ($col.HasSubQuery) {
+                    $lines += "  新值: (基于子查询计算)"
                 } else {
-                    $report += "  新值: $($setCol.Value)"
+                    $lines += "  新值: $($col.Value)"
                 }
             }
 
-            if ($upd.Conditions -and $upd.Conditions.Count -gt 0) {
-                $report += ""
-                $report += "更新条件 (WHERE):"
-                foreach ($cond in $upd.Conditions) {
-                    $report += "  - $cond"
+            if ($upd.Conditions.Count -gt 0) {
+                $lines += ""
+                $lines += "更新条件 (WHERE):"
+                foreach ($c in $upd.Conditions) {
+                    $lines += "  - $c"
                 }
             }
 
-            if ($upd.SubQueries -and $upd.SubQueries.Count -gt 0) {
-                $report += ""
-                $report += "依赖的子查询表:"
-                foreach ($sq in ($upd.SubQueries | Select-Object -Unique)) {
-                    $report += "  - $sq"
-                }
-            }
-
-            $report += ""
-            $updateNum++
+            $lines += ""
+            $num++
         }
     }
 
-    $report += "=" * 80
-    $report += "报告结束"
-    $report += "=" * 80
+    $lines += "=" * 80
+    $lines += "报告结束"
+    $lines += "=" * 80
 
-    return $report -join "`n"
+    return ($lines -join "`r`n")
 }
 
-# 主处理逻辑
+# 主处理
 foreach ($sqlFile in $sqlFiles) {
     Write-Host "正在分析: $($sqlFile.Name)" -ForegroundColor Cyan
-    Write-Log "开始分析文件: $($sqlFile.Name)"
+    Write-Log "开始分析: $($sqlFile.Name)"
 
     try {
-        # 读取SQL文件内容
-        $content = Get-Content -Path $sqlFile.FullName -Raw -Encoding UTF8
-
-        # 移除注释
-        $content = $content -replace "--[^\n]*", ""
-        $content = $content -replace "/\*[\s\S]*?\*/", ""
-
-        # 规范化空白
-        $content = $content -replace "\s+", " "
-
-        # 提取INSERT语句
-        $insertPattern = "INSERT\s+INTO\s+[^;]+;"
-        $insertMatches = [regex]::Matches($content, $insertPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-
-        $inserts = @()
-        foreach ($match in $insertMatches) {
-            $parsed = Parse-InsertStatement -Statement $match.Value
-            $inserts += $parsed
+        # 读取文件
+        $content = ""
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($sqlFile.FullName)
+            # 尝试UTF8
+            $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+        } catch {
+            $content = Get-Content -Path $sqlFile.FullName -Raw -Encoding Default
         }
 
-        # 提取UPDATE语句
-        $updatePattern = "UPDATE\s+[^;]+;"
-        $updateMatches = [regex]::Matches($content, $updatePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (!$content) {
+            Write-Host "无法读取文件" -ForegroundColor Red
+            continue
+        }
 
+        # 移除注释
+        # 单行注释
+        $content = [regex]::Replace($content, "--[^\r\n]*", "")
+        # 多行注释
+        $content = [regex]::Replace($content, "/\*[\s\S]*?\*/", "")
+        # 规范化空白
+        $content = [regex]::Replace($content, "\s+", " ")
+
+        # 提取INSERT
+        $insertStmts = Get-SQLStatements -Content $content -Keyword "INSERT INTO"
+        $inserts = @()
+        foreach ($stmt in $insertStmts) {
+            $ins = @{
+                TableName = Get-TableName -Statement $stmt -Keyword "INSERT"
+                Columns = @(Get-Columns -Statement $stmt)
+                ValueSource = Get-ValueSource -Statement $stmt
+                SourceTables = @(Get-SourceTables -Statement $stmt)
+                Conditions = @(Get-WhereConditions -Statement $stmt)
+                CaseLogic = @(Get-CaseLogic -Statement $stmt)
+            }
+            $inserts += $ins
+        }
+
+        # 提取UPDATE
+        $updateStmts = Get-SQLStatements -Content $content -Keyword "UPDATE"
         $updates = @()
-        foreach ($match in $updateMatches) {
-            $parsed = Parse-UpdateStatement -Statement $match.Value
-            $updates += $parsed
+        foreach ($stmt in $updateStmts) {
+            $upd = @{
+                TableName = Get-TableName -Statement $stmt -Keyword "UPDATE"
+                SetColumns = @(Get-SetColumns -Statement $stmt)
+                Conditions = @(Get-WhereConditions -Statement $stmt)
+            }
+            $updates += $upd
         }
 
         # 生成报告
         $report = Generate-Report -Inserts $inserts -Updates $updates -FileName $sqlFile.Name
 
-        # 输出报告文件
-        $outputFile = Join-Path $outDir "$($sqlFile.BaseName)_分析报告.txt"
-        $report | Out-File -FilePath $outputFile -Encoding UTF8
+        # 保存
+        $outFile = Join-Path $outDir ($sqlFile.BaseName + "_分析报告.txt")
+        [System.IO.File]::WriteAllText($outFile, $report, [System.Text.Encoding]::UTF8)
 
-        Write-Host "分析完成! 报告已保存到: $outputFile" -ForegroundColor Green
-        Write-Log "分析完成，输出文件: $outputFile"
+        Write-Host "分析完成! 报告保存到: $outFile" -ForegroundColor Green
+        Write-Log "完成: $outFile"
 
-        # 在控制台也显示报告
         Write-Host ""
         Write-Host $report
 
     } catch {
-        Write-Host "分析出错: $_" -ForegroundColor Red
+        Write-Host "错误: $_" -ForegroundColor Red
+        Write-Host $_.ScriptStackTrace -ForegroundColor Red
         Write-Log "错误: $_"
     }
 }
